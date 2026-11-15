@@ -266,16 +266,17 @@ Enter a natural-language question related to the enterprise document.
 ### Example Questions
 
 ```text
-What is the company's leave policy?
+What is an expert system?
 
-What are the eligibility requirements mentioned in the document?
+What are the main components of an expert system?
 
-What benefits are provided to employees?
+What is the difference between forward chaining and backward chaining?
 
-What is the policy regarding working hours?
+What are the advantages of expert systems?
 
-Summarize the key points of the company policy.
+How is an expert system tuned to improve its accuracy?
 ```
+Questions outside the document (for example, "What is the company's leave policy?") return a fallback message instead of an invented answer.
 
 The assistant retrieves the most relevant document chunks from ChromaDB and provides a context-grounded response using Google Gemini.
 
