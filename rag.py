@@ -1,202 +1,139 @@
+"""Retrieval and answer generation, shared by the Streamlit app and the command line.
+
+Command-line chat:  python rag.py
+"""
 import os
 import warnings
 
-warnings.filterwarnings(
-
-    "ignore",
-
-    message="Direct use of automatic function calling.*"
-
-)
 from dotenv import load_dotenv
-
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
-# ---------------------------------
-# 1. Load API key
-# ---------------------------------
+warnings.filterwarnings("ignore", message="Direct use of automatic function calling.*")
 
-load_dotenv()
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+CHAT_MODEL = "gemini-3.6-flash"
+PERSIST_DIRECTORY = "chroma_db"
+COLLECTION_NAME = "enterprise_documents"
 
-if not os.getenv("GOOGLE_API_KEY"):
-    raise ValueError("GOOGLE_API_KEY not found in .env")
-
-
-# ---------------------------------
-# 2. Load the same embedding model
-# ---------------------------------
-
-embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/gemini-embedding-001"
-)
+TOP_K = 3
+RELEVANCE_THRESHOLD = 0.5
+HISTORY_TURNS = 3  # question/answer pairs passed to the model
+FALLBACK_ANSWER = "I could not find this information in the enterprise document."
 
 
-# ---------------------------------
-# 3. Connect to existing ChromaDB
-# ---------------------------------
+def load_components():
+    """Create the vector store and LLM clients. Call once and reuse."""
+    load_dotenv()
+    if not os.getenv("GOOGLE_API_KEY"):
+        raise ValueError("GOOGLE_API_KEY not found in environment")
 
-vectorstore = Chroma(
-    persist_directory="chroma_db",
-    collection_name="enterprise_documents",
-    embedding_function=embeddings
-)
-
-
-# ---------------------------------
-# 4. Similarity-based retrieval
-# ---------------------------------
-
-def retrieve_documents(question, k=3, threshold=0.5):
-
-    results = vectorstore.similarity_search_with_relevance_scores(
-        question,
-        k=k
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+    vectorstore = Chroma(
+        persist_directory=PERSIST_DIRECTORY,
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
     )
+    llm = ChatGoogleGenerativeAI(model=CHAT_MODEL)
+    return vectorstore, llm
 
-    relevant_documents = []
 
-    for document, score in results:
+def retrieve_documents(vectorstore, question, k=TOP_K, threshold=RELEVANCE_THRESHOLD):
+    """Return the top-k chunks whose relevance score clears the threshold."""
+    results = vectorstore.similarity_search_with_relevance_scores(question, k=k)
+    return [document for document, score in results if score >= threshold]
 
-        if score >= threshold:
-            relevant_documents.append(document)
 
-    return relevant_documents
+def format_history(history, turns=HISTORY_TURNS):
+    """history is a list of (question, answer) pairs; keep only the most recent."""
+    return "\n".join(f"User: {q}\nAssistant: {a}" for q, a in history[-turns:])
 
-# ---------------------------------
-# 5. Create Gemini LLM
-# ---------------------------------
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
-    
-)
+def build_prompt(question, documents, history_text):
+    context = "\n\n".join(document.page_content for document in documents)
+    return f"""
+You are an enterprise knowledge assistant.
 
-# ---------------------------------
-# 6. Conversation loop
-# ---------------------------------
+Answer the question using ONLY the document context below.
+Use the previous conversation only to understand follow-up
+questions and references such as "it" or "that".
 
-chat_history = []
+If the answer is not present in the document context, say exactly:
+"{FALLBACK_ANSWER}"
 
-while True:
+Do not invent information. Give a clear and concise answer.
 
-    question = input("\nYou: ")
+Previous conversation:
+{history_text}
 
-    # Exit command
-    if question.lower() in ["exit", "quit", "bye"]:
-        print("\nGoodbye!")
-        break
-
-    # ---------------------------------
-    # 7. Retrieve relevant documents
-    # ---------------------------------
-
-    documents = retrieve_documents(question)
-
-    # ---------------------------------
-    # 8. Prepare context
-    # ---------------------------------
-
-    context = "\n\n".join(
-        document.page_content
-        for document in documents
-    )
-
-    # ---------------------------------
-    # 9. Prepare conversation history
-    # ---------------------------------
-
-    history = "\n".join(
-        f"User: {q}\nAssistant: {a}"
-        for q, a in chat_history
-    )
-
-    # ---------------------------------
-    # 10. Create prompt
-    # ---------------------------------
-
-    prompt = f"""
-You are an enterprise policy assistant.
-
-Answer the user's question using ONLY the information
-provided in the retrieved company policy context.
-
-Use the conversation history to understand follow-up
-questions and references such as "it", "this", "that",
-"the previous concept", or "give me an example".
-
-If the answer is not present in the company policy,
-say exactly:
-
-"I could not find this information in the company policy."
-
-Conversation History:
-{history}
-
-Retrieved Company Policy Context:
+Document context:
 {context}
 
-Current User Question:
+Current question:
 {question}
 
 Answer:
 """
 
-    # ---------------------------------
-    # 11. Generate answer
-    # ---------------------------------
 
-    response = llm.invoke(prompt)
-
+def extract_text(response):
+    """Gemini can return either a string or a list of content parts."""
     if isinstance(response.content, list):
+        return "".join(
+            item.get("text", "")
+            for item in response.content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return response.content
 
-        answer = ""
 
-        for item in response.content:
+def source_pages(documents):
+    """Unique 1-based page numbers, in retrieval order."""
+    pages = []
+    for document in documents:
+        page = document.metadata.get("page")
+        if isinstance(page, int):
+            page += 1
+        if page is not None and page not in pages:
+            pages.append(page)
+    return pages
 
-            if isinstance(item, dict) and item.get("type") == "text":
-                answer += item.get("text", "")
 
-    else:
-        answer = response.content
+def answer_question(vectorstore, llm, question, history):
+    """Return (answer, source_pages) for one question."""
+    history_text = format_history(history)
 
-    # ---------------------------------
-    # 12. Display answer
-    # ---------------------------------
+    # Include the previous question so follow-ups like "give an example" retrieve well.
+    retrieval_query = f"{history[-1][0]}\n{question}" if history else question
+    documents = retrieve_documents(vectorstore, retrieval_query)
 
-    print("\n========================================")
-    print("ANSWER")
-    print("========================================")
+    # Nothing relevant enough: skip the LLM call and return the fixed fallback.
+    if not documents:
+        return FALLBACK_ANSWER, []
 
-    print(answer)
+    answer = extract_text(llm.invoke(build_prompt(question, documents, history_text)))
 
-    # ---------------------------------
-    # 13. Display sources
-    # ---------------------------------
+    if FALLBACK_ANSWER in answer:
+        return FALLBACK_ANSWER, []
+    return answer, source_pages(documents)
 
-    print("\n========================================")
-    print("SOURCES")
-    print("========================================")
 
-    if documents:
+def main():
+    vectorstore, llm = load_components()
+    history = []
+    while True:
+        question = input("\nYou: ").strip()
+        if question.lower() in {"exit", "quit", "bye"}:
+            print("\nGoodbye!")
+            break
+        if not question:
+            continue
+        answer, pages = answer_question(vectorstore, llm, question, history)
+        print(f"\nAssistant: {answer}")
+        if pages:
+            print("Sources: " + ", ".join(f"Page {p}" for p in pages))
+        history.append((question, answer))
 
-        for document in documents:
 
-            page = document.metadata.get("page", "Unknown")
-
-            print(
-                f"- Page {page + 1 if isinstance(page, int) else page}"
-            )
-
-    else:
-
-        print("- No relevant company policy source found.")
-
-    # ---------------------------------
-    # 14. Save conversation
-    # ---------------------------------
-
-    chat_history.append(
-        (question, answer)
-    )
+if __name__ == "__main__":
+    main()

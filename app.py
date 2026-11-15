@@ -1,12 +1,6 @@
-import os
 import streamlit as st
-from dotenv import load_dotenv
 
-from langchain_google_genai import (
-    ChatGoogleGenerativeAI,
-    GoogleGenerativeAIEmbeddings
-)
-from langchain_chroma import Chroma
+from rag import answer_question, load_components
 
 
 # =========================================================
@@ -103,56 +97,23 @@ st.markdown("""
 
 
 # =========================================================
-# 3. LOAD ENVIRONMENT
+# 3. LOAD RAG COMPONENTS (cached, so created once per server)
 # =========================================================
 
-load_dotenv()
+@st.cache_resource
+def get_components():
+    return load_components()
 
-if not os.getenv("GOOGLE_API_KEY"):
-    st.error("GOOGLE_API_KEY not found in .env")
+
+try:
+    vectorstore, llm = get_components()
+except ValueError as error:
+    st.error(str(error))
     st.stop()
 
 
 # =========================================================
-# 4. LOAD EMBEDDING MODEL
-# =========================================================
-
-embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/gemini-embedding-001"
-)
-
-
-# =========================================================
-# 5. CONNECT TO CHROMADB
-# =========================================================
-
-vectorstore = Chroma(
-    persist_directory="chroma_db",
-    collection_name="enterprise_documents",
-    embedding_function=embeddings
-)
-
-
-# =========================================================
-# 6. CREATE RETRIEVER
-# =========================================================
-
-retriever = vectorstore.as_retriever(
-    search_kwargs={"k": 3}
-)
-
-
-# =========================================================
-# 7. CREATE GEMINI MODEL
-# =========================================================
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash"
-)
-
-
-# =========================================================
-# 8. SESSION STATE
+# 4. SESSION STATE
 # =========================================================
 
 if "messages" not in st.session_state:
@@ -160,7 +121,7 @@ if "messages" not in st.session_state:
 
 
 # =========================================================
-# 9. SIDEBAR
+# 5. SIDEBAR
 # =========================================================
 
 with st.sidebar:
@@ -198,7 +159,7 @@ with st.sidebar:
 
 
 # =========================================================
-# 10. HEADER
+# 6. HEADER
 # =========================================================
 
 st.markdown("""
@@ -215,7 +176,7 @@ AI-powered question answering using Retrieval-Augmented Generation
 
 
 # =========================================================
-# 11. WELCOME MESSAGE
+# 7. WELCOME MESSAGE
 # =========================================================
 
 if len(st.session_state.messages) == 0:
@@ -226,7 +187,7 @@ if len(st.session_state.messages) == 0:
 
 
 # =========================================================
-# 12. DISPLAY CHAT HISTORY
+# 8. DISPLAY CHAT HISTORY
 # =========================================================
 
 for message in st.session_state.messages:
@@ -252,26 +213,9 @@ for message in st.session_state.messages:
                     )
                 )
 
-        # Display sources
-        if message.get("sources"):
-
-            sources = ", ".join(
-                f"Page {page}"
-                for page in message["sources"]
-            )
-
-            st.markdown(
-                f"""
-                <div class="source-box">
-                📄 <b>Sources:</b> {sources}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
 
 # =========================================================
-# 13. USER INPUT
+# 9. USER INPUT
 # =========================================================
 
 question = st.chat_input(
@@ -280,141 +224,30 @@ question = st.chat_input(
 
 
 # =========================================================
-# 14. PROCESS QUESTION
-# =========================================================
-
-# =========================================================
-# HANDLE USER QUESTION
+# 10. HANDLE USER QUESTION
 # =========================================================
 
 if question:
 
-    # Save user's question
+    # Turn stored messages into (question, answer) pairs
+    messages = st.session_state.messages
+    history = [
+        (messages[i]["content"], messages[i + 1]["content"])
+        for i in range(0, len(messages) - 1, 2)
+    ]
+
+    with st.spinner("Searching the document..."):
+        answer, sources = answer_question(vectorstore, llm, question, history)
+
     st.session_state.messages.append({
         "role": "user",
         "content": question
     })
-
-    # -----------------------------------------------------
-    # Build conversation context
-    # -----------------------------------------------------
-
-    previous_messages = st.session_state.messages[:-1]
-
-    conversation_history = "\n".join(
-        f"{message['role'].capitalize()}: {message['content']}"
-        for message in previous_messages[-6:]
-    )
-
-    # -----------------------------------------------------
-    # Create retrieval query
-    # -----------------------------------------------------
-
-    retrieval_query = f"""
-Previous conversation:
-{conversation_history}
-
-Current question:
-{question}
-"""
-
-    # -----------------------------------------------------
-    # Retrieve relevant document chunks
-    # -----------------------------------------------------
-
-    documents = retriever.invoke(retrieval_query)
-
-    # -----------------------------------------------------
-    # Prepare document context
-    # -----------------------------------------------------
-
-    context = "\n\n".join(
-        document.page_content
-        for document in documents
-    )
-
-    # -----------------------------------------------------
-    # Create prompt
-    # -----------------------------------------------------
-
-    prompt = f"""
-You are an enterprise knowledge assistant.
-
-Your job is to answer questions using ONLY the
-information contained in the provided enterprise document.
-
-You should also use the previous conversation to
-understand follow-up questions.
-
-Previous conversation:
-{conversation_history}
-
-Relevant document context:
-{context}
-
-Current question:
-{question}
-
-Instructions:
-
-1. Answer using only the provided document context.
-2. Use previous conversation only to understand what
-   the user is referring to.
-3. If the required information is not present in the
-   document context, say:
-   "I could not find this information in the enterprise document."
-4. Do not invent information.
-5. Give a clear and concise answer.
-
-Answer:
-"""
-
-    # -----------------------------------------------------
-    # Generate answer
-    # -----------------------------------------------------
-
-    response = llm.invoke(prompt)
-
-    if isinstance(response.content, list):
-
-        answer = ""
-
-        for item in response.content:
-
-            if isinstance(item, dict) and item.get("type") == "text":
-                answer += item.get("text", "")
-
-    else:
-        answer = response.content
-
-    # -----------------------------------------------------
-    # Get source pages
-    # -----------------------------------------------------
-
-    sources = []
-
-    for document in documents:
-
-        page = document.metadata.get("page")
-
-        if isinstance(page, int):
-            page = page + 1
-
-        if page not in sources:
-            sources.append(page)
-
-    # -----------------------------------------------------
-    # Save assistant response
-    # -----------------------------------------------------
 
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer,
         "sources": sources
     })
-
-    # -----------------------------------------------------
-    # Rerun to display updated conversation
-    # -----------------------------------------------------
 
     st.rerun()
